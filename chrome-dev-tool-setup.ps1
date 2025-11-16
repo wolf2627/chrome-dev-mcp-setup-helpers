@@ -30,6 +30,7 @@ $script:Session = [ordered]@{
     Mode = $Mode
     ProfileDir = $null
 }
+$script:CleanupNeeded = $false
 
 function Test-Administrator {
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -334,6 +335,59 @@ function Stop-ChromeDebug {
     }
 }
 
+function Resolve-Conflicts {
+    param(
+        [bool]$HasProcess,
+        [bool]$HasProxy,
+        [bool]$HasFirewall
+    )
+
+    $needsCleanup = ($HasProcess -eq $true) -or ($HasProxy -eq $true) -or ($HasFirewall -eq $true)
+    if (-not $needsCleanup) {
+        return @{ Continue = $true; AlternatePort = $null; Abort = $false }
+    }
+
+    Write-Host "=== Conflict Detected ===" -ForegroundColor Yellow
+    if ($HasProcess) {
+        Write-Host "- Chrome already listening on port $($script:Session.Port)." -ForegroundColor Gray
+    }
+    if ($HasProxy) {
+        Write-Host "- Port proxy exists for $($script:Session.ListenAddress):$($script:Session.Port)." -ForegroundColor Gray
+    }
+    if ($HasFirewall) {
+        Write-Host "- Firewall rule 'Chrome CDP $($script:Session.Port)' already present." -ForegroundColor Gray
+    }
+
+    $choice = $null
+    while ($null -eq $choice) {
+        $answer = (Read-Host "Proceed by removing conflicts? (Y)es / (C)hoose new port / (N)o").Trim().ToUpperInvariant()
+        switch ($answer) {
+            "Y" { $choice = 'cleanup' }
+            "C" { $choice = 'alternate' }
+            "N" { $choice = 'abort' }
+            default { Write-Host "[WARN] Please respond with Y, C, or N." -ForegroundColor Yellow }
+        }
+    }
+
+    if ($choice -eq 'cleanup') {
+        return @{ Continue = $true; AlternatePort = $null; Abort = $false }
+    }
+    elseif ($choice -eq 'alternate') {
+        while ($true) {
+            $newPort = Read-IntWithDefault -Prompt "Enter alternate port" -Default $script:Session.Port
+            if ($newPort -eq $script:Session.Port) {
+                Write-Host "[WARN] Alternate port must differ from the current port." -ForegroundColor Yellow
+                continue
+            }
+            $script:Session.Port = $newPort
+            Write-Host ("[OK] Using alternate port {0}." -f $script:Session.Port) -ForegroundColor Green
+            return @{ Continue = $false; AlternatePort = $script:Session.Port; Abort = $false }
+        }
+    }
+
+    return @{ Continue = $false; AlternatePort = $null; Abort = $true }
+}
+
 function Stop-ExistingInstances {
     Write-Host "=== Checking for existing instances ===" -ForegroundColor Yellow
 
@@ -347,20 +401,24 @@ function Stop-ExistingInstances {
         return
     }
 
-    if ($processes) {
-        Write-Host "[WARN] Found running Chrome processes using the same debug port." -ForegroundColor Yellow
-    }
-    if ($proxyExists) {
-        Write-Host "[WARN] Found an existing port proxy configuration." -ForegroundColor Yellow
-    }
-    if ($ruleExists) {
-        Write-Host "[WARN] Found an existing firewall rule." -ForegroundColor Yellow
+    $decision = Resolve-Conflicts -HasProcess ([bool]$processes) -HasProxy ([bool]$proxyExists) -HasFirewall ([bool]$ruleExists)
+
+    if ($decision.Abort) {
+        throw [System.OperationCanceledException]"User aborted due to existing conflicts."
     }
 
-    Write-Host "[INFO] Cleaning up previous run..." -ForegroundColor Cyan
-    Stop-ChromeDebug -Quiet -ForceNetworkCleanup
-    Start-Sleep -Seconds 2
-    Write-Host ""
+    if ($decision.AlternatePort) {
+        Write-Host "[INFO] Re-running conflict check with alternate port..." -ForegroundColor Cyan
+        Stop-ExistingInstances
+        return
+    }
+
+    if ($decision.Continue) {
+        Write-Host "[INFO] Cleaning up previous run..." -ForegroundColor Cyan
+        Stop-ChromeDebug -Quiet -ForceNetworkCleanup
+        Start-Sleep -Seconds 2
+        Write-Host ""
+    }
 }
 
 function Show-RunningStatus {
@@ -396,6 +454,7 @@ function Start-DebugMonitor {
 }
 
 function Start-ChromeDebug {
+    $script:CleanupNeeded = $true
     $chromePath = Get-ChromePath
     $uniqueSuffix = [Guid]::NewGuid().ToString("N")
     $script:Session.ProfileDir = Join-Path -Path $env:TEMP -ChildPath ("chrome-remote-profile-{0}-{1}" -f $script:Session.Port, $uniqueSuffix)
@@ -485,16 +544,26 @@ try {
     Start-ChromeDebug
     Start-DebugMonitor
 }
+catch [System.OperationCanceledException] {
+    Write-Host ""
+    Write-Host "[INFO] Operation canceled by user before starting Chrome." -ForegroundColor Yellow
+}
 catch {
     Write-Host ""
     Write-Host ("[ERROR] {0}" -f $_.Exception.Message) -ForegroundColor Red
 }
 finally {
-    try {
-        Stop-ChromeDebug
+    if ($script:CleanupNeeded) {
+        try {
+            Stop-ChromeDebug
+        }
+        catch {
+            Write-Host ("[WARN] Cleanup encountered an error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+        }
     }
-    catch {
-        Write-Host ("[WARN] Cleanup encountered an error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    else {
+        Write-Host ""
+        Write-Host "[INFO] No resources were started; skipping cleanup." -ForegroundColor Gray
     }
 
     Write-Host ""
